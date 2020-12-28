@@ -14,13 +14,13 @@ Proper usage requires that you, the user know the location of the iPhone backup'
 This script produces the `urls.txt` file and an optional copied collection of all images matching the `image` type. If this option is enabled within the `main()` function, all matching images will be copied into a newly created directory placed within your current working directory.
 
 ## Main() Re-Write Options and Examples [DIY]
-####Filter By Domain String Example
+#### Filter By Domain String Example
 `filter_manifest_by_domain_str('RootDomain', print_report=True)`
-####Filter By MIME Extension Type Example
+#### Filter By MIME Extension Type Example
 `filter_manifest_by_mime_type('text/plain', print_report=True)`
-####Filter By SQL Entry String Example
+#### Filter By SQL Entry String Example
 `filter_manifest_by_sql_entry('sms.db', print_report=True)`
-####Full Example of How to Copy All Images
+#### Full Example of How to Copy All Images
 `filter_manifest_by_mime_type('image', print_report=True)  copy_to_tmp(output_database)`
 
 ## License
