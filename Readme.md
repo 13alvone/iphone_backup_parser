@@ -1,33 +1,42 @@
 # iPhone Backup Parser
-This is a basic script written to parse an iphone backup that is stored to a user's machine.  The initial intention of this script was to retreive all http links that I had sent to myself via SMS texts over the past several years. As I began processing the data produced from performing a local iPhone 11 (iOS 11.0.1) backup on an M1 Macbook (OSX 11.0.1), I added a lot of unused functionality to expand this script's usage in the future. This particular parser uses the python sqlite3 module to iterate through the manifest.db files which appears to define the internal structure of the stored backup.
 
-NOTE: This is a purely experimental script with absolutely no warranty express or implied. Please use with caution and at your own risk.
+This script parses an iPhone backup manifest (`manifest.db`) found on a user’s machine. Its primary features include:
+- Extracting and listing all HTTP and HTTPS links from SMS messages or any other tables in the backup database.
+- Filtering parsed data by domain, MIME type, or specific strings within database entries.
+- Copying files (such as images) matching certain criteria (e.g., `image` MIME type) into a local output folder.
+- Logging all activity, including warnings and errors, using Python’s logging module.
 
 ## Usage
+1. **Install Dependencies**  
+	If you are missing `python-magic` or other modules, you may also need to install `libmagic` (for macOS: `brew install libmagic`):
+		pip3 install python-magic
 
-Proper usage requires that you, the user know the location of the iPhone backup's manifest file, which was found here for me:
->/Users/username/Library/Application Support/MobileSync/Backup/<backup_identifier>
+2. **Run the Script**  
+		chmod +x iphone_backup_parser.py
+		./iphone_backup_parser.py <pathToManifest.db>
 
-`# Python3 -f <pathToManifest.db>`
+3. **Command-Line Argument**  
+	A single positional argument is required: the path to your `manifest.db`. For example:
+		./iphone_backup_parser.py "/Users/username/Library/Application Support/MobileSync/Backup/<backupID>/Manifest.db"
 
-## Artifacts
-This script produces the `urls.txt` file and an optional copied collection of all images matching the `image` type. If this option is enabled within the `main()` function, all matching images will be copied into a newly created directory placed within your current working directory.
+## Output
+- A `urls.txt` file containing all extracted URLs (excluding any blocklisted entries).
+- Logs all processed data and errors to stdout with clear logging prefixes (`[i]` for info, `[!]` for warnings, `[x]` for errors).
+- An optional feature lets you copy images (or other file types) from the backup into a time-stamped folder in your current directory.
 
-## Main() Re-Write Options and Examples [DIY]
-#### Filter By Domain String Example
-`filter_manifest_by_domain_str('RootDomain', print_report=True)`
-#### Filter By MIME Extension Type Example
-`filter_manifest_by_mime_type('text/plain', print_report=True)`
-#### Filter By SQL Entry String Example
-`filter_manifest_by_sql_entry('sms.db', print_report=True)`
-#### Full Example of How to Copy All Images
-`filter_manifest_by_mime_type('image', print_report=True)  copy_to_tmp(output_database)`
+## Examples
+- Filtering by a specific domain:
+		filter_manifest_by_domain_str(output_database, 'RootDomain', print_report=True)
 
-## Requirements
-This particular parser uses the python sqlite3 module to iterate through the manifest.db files which appears to define the internal structure of the stored backup.
+- Filtering by MIME type:
+		filter_manifest_by_mime_type(output_database, 'text/plain', print_report=True)
 
-For other requirements not included in the general 3.9.1 python build, do:
-`pip3 install -r requirements.txt`
+- Filtering by SQL entry:
+		filter_manifest_by_sql_entry(output_database, 'sms.db', print_report=True)
+
+- Copying images:
+		images_dict = filter_manifest_by_mime_type(output_database, 'image', print_report=True)
+		copy_to_tmp(images_dict)
 
 ## License
-See the `License` file found within this project's root directory.
+See the `License` file in this project’s root directory for further information.
