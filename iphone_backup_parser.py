@@ -1,336 +1,449 @@
-import subprocess
-import plistlib
 import argparse
-import sqlite3
 import logging
-import magic
 import math
-import time
-import re
 import os
+import plistlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import time
 
-# Global Variables
-start_time = time.time()
-report_list = []
-url_set = set()
-output_database = {}
-file_walk_database = {}
-sms_db_hash = None
-sms_database = {}
-magic_generator = magic.Magic(flags=magic.MAGIC_MIME_TYPE)
-url_block_list = [
-    'content.icloud.com',
-]
+import magic
 
+# ------------------------------------------------------------------------------
+# Logging Configuration
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
 
 def is_sqlite3(_path):
-    process = subprocess.run(['file', _path], check=True, stdout=subprocess.PIPE, universal_newlines=True)
-    output = f'{process.stdout}'.lower()
-    if 'sqlite' in output:
-        return True
-    else:
+    """
+    Check if a file is an SQLite3 database by calling 'file <filename>'.
+    If 'sqlite' is in the output, return True.
+    """
+    try:
+        process = subprocess.run(
+            ['file', _path],
+            check=True,
+            stdout=subprocess.PIPE,
+            universal_newlines=True
+        )
+        output = f'{process.stdout}'.lower()
+        return 'sqlite' in output
+    except subprocess.CalledProcessError as e:
+        logging.error(f'[x] Unable to determine file type for: {_path} -> {e}')
         return False
 
-
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-f', '--file_path', help='Target SQLite3 Path', type=str, required=True)
-    arguments = parser.parse_args()
-    return arguments
+    """
+    Parse command-line arguments using argparse. 
+    User must provide the path to the target SQLite3 manifest file.
+    """
+    parser = argparse.ArgumentParser(
+        description='Parse iPhone backup manifest.db for links, images, and more.'
+    )
+    parser.add_argument(
+        'file_path',
+        help='Target SQLite3 Path (manifest.db)',
+        type=str
+    )
+    return parser.parse_args()
 
+def print_elapsed_time(start_time):
+    """
+    Log the total elapsed time in MM:SS format.
+    """
+    seconds = time.time() - start_time
+    minutes = math.floor(seconds / 60)
+    remaining_seconds = int(seconds - (minutes * 60))
+    elapsed_time = f'{minutes:02d}:{remaining_seconds:02d}'
+    logging.info(f'[i] Total Time Elapsed: {elapsed_time}')
 
-def print_elapsed_time(_start_time):
-    seconds = round(int(time.time() - _start_time), 2)
-    minutes = math.trunc(seconds / 60)
-    remaining_seconds = math.trunc(seconds - (minutes * 60))
-    if len(f'{remaining_seconds}') != 2:
-        remaining_seconds = f'0{remaining_seconds}'
-    elapsed_time = f'{minutes}:{remaining_seconds}'
-    print(f'[i] Total_Time Elapsed: {elapsed_time}')
-
-
-def convert_sqlite3_to_sql_dict(_path):
+def convert_sqlite3_to_sql_dict(sqlite_path):
+    """
+    Read all tables from the SQLite database and store each row in 
+    a dictionary: { "<tableName>_<rowID>": row_contents, ... }
+    """
     result_dict = {}
-    conn = sqlite3.connect(_path)
-    cursor = conn.cursor()
-    cursor.execute('SELECT name from sqlite_master where type="table"')
-    tables = cursor.fetchall()
-    for table in tables:
-        table_name = table[0]
-        qry = f'SELECT * from "{table_name}"'
-        cursor.execute(qry)
-        contents = cursor.fetchall()
-        for content in contents:
-            uuid = content[0]
-            key = f'{table_name}_{uuid}'
-            result_dict[key] = content
+    try:
+        with sqlite3.connect(sqlite_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT name FROM sqlite_master WHERE type="table"')
+            tables = cursor.fetchall()
+            for table in tables:
+                table_name = table[0]
+                qry = f'SELECT * FROM "{table_name}"'
+                cursor.execute(qry)
+                contents = cursor.fetchall()
+                for content in contents:
+                    uuid = content[0]
+                    key = f'{table_name}_{uuid}'
+                    result_dict[key] = content
+    except sqlite3.Error as e:
+        logging.error(f'[x] SQLite Error while reading: {sqlite_path} -> {e}')
     return result_dict
 
+def re_extract_urls(url_string_or_bytes, url_block_list, add_url_func):
+    """
+    Extract any URLs from a string or bytes object. 
+    The add_url_func is a callback used to add a URL to a set (or other structure).
+    """
+    if isinstance(url_string_or_bytes, bytes):
+        try:
+            url_string_or_bytes = url_string_or_bytes.decode('ascii', 'ignore')
+        except UnicodeDecodeError as e:
+            logging.warning(f'[!] Could not decode bytes -> {e}')
+            return
 
-def iterate_sql_dict(_sqlite3_dict):
-    global report_list, sms_database
-    for key in _sqlite3_dict:
-        report_list.append(f'[+] Item: {key}\n')
-        if isinstance(_sqlite3_dict[key], dict):
-            iterate_sql_dict(_sqlite3_dict[key])
-        else:
-            data_body = _sqlite3_dict[key]
-            report_list.append(f'[^] {data_body}\n')
-            try:
-                generate_cleaned_manifest_entry(data_body, print_item=False)    # Do Iterative Action From Here Down...
-            except:
-                pass
-            if sms_db_hash:
-                sms_database[key] = data_body
+    # If it's still not a string by here, bail out
+    if not isinstance(url_string_or_bytes, str):
+        return
 
+    url_list = re.findall(r'(https?://\S+)', url_string_or_bytes)
+    for url in url_list:
+        # Check blocklist inside add_url_func
+        add_url_func(url, url_block_list)
 
-def global_filter(_obj):
-    global url_set, url_allow_list
-    if isinstance(_obj, int) or isinstance(_obj, str):
-        re_extract_urls(_obj)
-        return _obj
-    elif isinstance(_obj, bytes):
-        _obj_raw_ascii = _obj.decode('ascii', 'ignore')
-        if 'bplist' in _obj_raw_ascii:
-            try:
-                _obj = plistlib.loads(_obj, fmt=None, dict_type=dict)
-                re_extract_urls(_obj)
-            except:
-                pass
-        return _obj
-    elif isinstance(_obj, dict):
-        re_extract_urls(_obj)
-        for key in _obj:
-            _obj[key] = global_filter(_obj[key])
-        return _obj
-    elif isinstance(_obj, list) or isinstance(_obj, tuple):
-        re_extract_urls(_obj)
+def global_filter(obj, url_block_list, add_url_func):
+    """
+    Recursively parse Python structures (dict, list, set, etc.), searching for URLs,
+    and also parse embedded binary plists if found.
+    """
+    if isinstance(obj, (int, str)):
+        # Extract any URLs from string or int (int -> str)
+        re_extract_urls(str(obj), url_block_list, add_url_func)
+        return obj
+    elif isinstance(obj, bytes):
+        # If it looks like a plist, try to parse it
+        try:
+            obj_str = obj.decode('ascii', 'ignore')
+            if 'bplist' in obj_str:
+                # Attempt to parse as plist
+                try:
+                    loaded_plist = plistlib.loads(obj, fmt=None, dict_type=dict)
+                    global_filter(loaded_plist, url_block_list, add_url_func)
+                except Exception as e:
+                    logging.warning(f'[!] Unable to parse as bplist -> {e}')
+            re_extract_urls(obj, url_block_list, add_url_func)
+        except Exception as e:
+            logging.warning(f'[!] Exception decoding bytes -> {e}')
+        return obj
+    elif isinstance(obj, dict):
+        # Re-extract any URLs in keys and values
+        for k, v in list(obj.items()):
+            re_extract_urls(str(k), url_block_list, add_url_func)
+            obj[k] = global_filter(v, url_block_list, add_url_func)
+        return obj
+    elif isinstance(obj, (list, tuple)):
+        # Re-extract any URLs from each item
         new_list = []
-        for item in _obj:
-            new_list.append(global_filter(item))
-        _obj = new_list
-        return _obj
-    elif isinstance(_obj, set):
-        re_extract_urls(_obj)
+        for item in obj:
+            new_list.append(global_filter(item, url_block_list, add_url_func))
+        return new_list
+    elif isinstance(obj, set):
         new_set = set()
-        for item in _obj:
-            new_set.add(global_filter(item))
-        _obj = new_set
-        return _obj
+        for item in obj:
+            new_set.add(global_filter(item, url_block_list, add_url_func))
+        return new_set
+    else:
+        return obj
 
+def generate_cleaned_manifest_entry(data_body):
+    """
+    Convert a row from the sqlite3 content into a structured dict.
+    The original code had indexes for domain, sql_entry, etc.
+    """
+    serial = data_body[0]
+    domain_data = data_body[1]
+    sql_entry = data_body[2]
+    unknown_number = data_body[3]
+    manifest_data = data_body[4]
 
-def generate_cleaned_manifest_entry(_data_body, print_item=True):
-    global output_database, sms_db_hash
-    serial = _data_body[0]
-    directory_data = 'Unknown'
-    data_type = 'Unknown'
-
-    manifest_entry_dict = {
-        'path': directory_data,
-        'domain': _data_body[1],
-        'sql_entry': _data_body[2],
-        'unknown_number': _data_body[3],
-        'data': _data_body[4],
-        'type': data_type,
+    entry_dict = {
+        'serial': serial,
+        'domain': domain_data,
+        'sql_entry': sql_entry,
+        'unknown_number': unknown_number,
+        'manifest_data': manifest_data,
+        'path': 'Unknown',
+        'type': 'Unknown'
     }
-    output_database[serial] = manifest_entry_dict
-    try:
-        if 'sms.db' in manifest_entry_dict['sql_entry']:
-            sms_db_hash = serial
-    except TypeError:
-        pass
+    return entry_dict
 
-    if print_item:
-        msg = f'{"-" * 50}\n[+] {serial}\n' \
-              f'[^] Directory:\t{manifest_entry_dict["directory"]}\n' \
-              f'[^] Domain:\t{manifest_entry_dict["domain"]}\n' \
-              f'[^] SQL Entry:\t{manifest_entry_dict["sql_entry"]}\n' \
-              f'[^] Unknown:\t{manifest_entry_dict["unknown_number"]}\n' \
-              f'[^] Manifest Data:\t{manifest_entry_dict["manifest_data"]}\n' \
-              f'[^] Type:\t{manifest_entry_dict["type"]}'
-        print(msg)
-
-
-def add_url(_url):
-    global url_set, url_block_list
+def add_url(url, url_block_list, url_set=None):
+    """
+    Add URL to a set if it does not contain any blocklisted items.
+    """
+    if url_set is None:
+        return
     for blocked_url in url_block_list:
-        if blocked_url in _url:
-            return None
-    url_set.add(_url)
+        if blocked_url in url:
+            return
+    url_set.add(url)
 
+def iterate_sql_dict(sql_dict, output_database, sms_database, url_block_list, url_set):
+    """
+    For each entry in the dictionary from the SQLite DB:
+      1. Generate a cleaned manifest entry.
+      2. Identify 'sms.db' references if present.
+      3. Optionally process data for embedded URLs, etc.
+    """
+    sms_db_hash = None
+    for key, data_body in sql_dict.items():
+        try:
+            # Convert to a structured dictionary
+            manifest_entry = generate_cleaned_manifest_entry(data_body)
+            output_database[manifest_entry['serial']] = manifest_entry
 
-def re_extract_urls(_data):
-    try:
-        if isinstance(_data, list) or isinstance(_data, tuple) or isinstance(_data, set):
-            for entry in _data:
-                url_list = re.findall(r'(https?://\S+)', entry)
-                for url in url_list:
-                    add_url(url)
-        elif isinstance(_data, dict):
-            for key in _data:
-                url_list0 = re.findall(r'(https?://\S+)', key)
-                url_list1 = re.findall(r'(https?://\S+)', _data[key])
-                for url in url_list0:
-                    add_url(url)
-                for url in url_list1:
-                    add_url(url)
-        elif isinstance(_data, str):
-            url_list = re.findall(r'(https?://\S+)', _data)
-            for url in url_list:
-                add_url(url)
-        elif isinstance(_data, bytes):
-            url_list = re.findall(r'(https?://\S+)', _data.decode('ascii', 'ignore'))
-            for url in url_list:
-                add_url(url)
-    except TypeError as e:
-        logging.info(e)
+            # Identify 'sms.db'
+            if 'sms.db' in manifest_entry['sql_entry']:
+                sms_db_hash = manifest_entry['serial']
 
+            # Perform a quick global_filter on the data body 
+            # (some rows might contain text or plist data)
+            global_filter(data_body, url_block_list, 
+                          lambda u, block_list: add_url(u, block_list, url_set))
 
-def process_data_set(_sqlite3_dict, print_report=False):
-    global report_list
-    report_list.clear()
-    iterate_sql_dict(_sqlite3_dict)
-    if print_report:
-        for entry in report_list:
-            print(entry)
+        except Exception as e:
+            logging.error(f'[x] Error iterating {key} -> {e}')
+    return sms_db_hash
 
-
-def walk_the_backup(_path):
-    global file_walk_database
-    target_path = '/'.join(_path.split('/')[:-1])
+def walk_the_backup(file_path):
+    """
+    Walk the directory containing the manifest.db file to build a dict:
+    { <filename>: <full_path>, ... }
+    """
+    file_walk_database = {}
+    target_path = os.path.dirname(file_path)
     for root, dirs, files in os.walk(target_path, topdown=False):
         for filename in files:
-            full_path = f'{root}/{filename}'
+            full_path = os.path.join(root, filename)
             file_walk_database[filename] = full_path
+    return file_walk_database
 
-
-def print_types_dict(_input_dict):
-    for key in _input_dict:
-        print(f'[+] MIME Type: {key}\t\t{_input_dict[key]}')
-
-
-def filter_by_domain_str(_filter_str, print_types=False):
-    global output_database
-    result_dict = {}
-    type_dict = {}
-    for key in output_database:
-        if output_database[key]['path'] != 'Unknown' and output_database[key]['domain'] == _filter_str:
-            if print_types:
-                print(f'[+] {key}\n[^] {output_database[key]}\n{"-" * 50}\n')
-            result_dict[key] = output_database[key]
-            if output_database[key]['type'] not in type_dict:
-                type_dict[output_database[key]['type']] = 1
-            elif output_database[key]['type'] in type_dict:
-                type_dict[output_database[key]['type']] += 1
-    if print_types:
-        print_types_dict(type_dict)
-    return result_dict
-
-
-def filter_manifest_by_mime_type(_mime_type_str, print_report=False):     # This is a `contains` filter
-    global output_database
-    result_dict = {}
-    type_dict = {}
-    for key in output_database:
-        if output_database[key]['path'] != 'Unknown' and _mime_type_str in output_database[key]['type']:
-            if print_report:
-                print(f'[+] {key}\n[^] {output_database[key]}\n{"-" * 50}\n')
-            result_dict[key] = output_database[key]
-            if output_database[key]['type'] not in type_dict:
-                type_dict[output_database[key]['type']] = 1
-            elif output_database[key]['type'] in type_dict:
-                type_dict[output_database[key]['type']] += 1
-    if print_report:
-        print_types_dict(type_dict)
-    return result_dict
-
-
-def filter_manifest_by_sql_entry(_sql_entry_str, print_report=False):     # This is a `contains` filter
-    global output_database
-    result_dict = {}
-    type_dict = {}
-    for key in output_database:
-        if output_database[key]['path'] != 'Unknown' and _sql_entry_str in output_database[key]['sql_entry']:
-            if print_report:
-                print(f'[+] {key}\n[^] {output_database[key]}\n{"-" * 50}\n')
-            result_dict[key] = output_database[key]
-            if output_database[key]['type'] not in type_dict:
-                type_dict[output_database[key]['type']] = 1
-            elif output_database[key]['type'] in type_dict:
-                type_dict[output_database[key]['type']] += 1
-    if print_report:
-        print_types_dict(type_dict)
-    return result_dict
-
-
-def copy_to_tmp(_output_database):
-    target_path = f'{time.strftime("%Y%m%d-%H%M%S")}_output'
-    subprocess.run(f'mkdir {target_path}', shell=True, check=True, stdout=subprocess.PIPE)
-    for key in _output_database:
-        filename = output_database[key]['sql_entry'].split('/')[-1].replace(' ', '_')
-        file_path = output_database[key]['path']
-        cmd = f'cp "{file_path}" "{target_path}/{filename}"'
-        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE)
-
-
-def examine_and_process_db_file(_file_path, print_report=False):
-    global output_database
-    output_database = {}
-    if is_sqlite3(_file_path):
-        sqlite3_dict = convert_sqlite3_to_sql_dict(_file_path)
-        if print_report:
-            process_data_set(sqlite3_dict, print_report=True)
-        else:
-            process_data_set(sqlite3_dict)
-        walk_the_backup(_file_path)
-    else:
-        logging.info(f'[!] The following supplied file path is not SQLite3\n{_file_path}\n')
-
-
-def add_metadata_to_db_file():
-    global file_walk_database
+def add_metadata_to_db_file(output_database, file_walk_database, magic_generator):
+    """
+    For each entry in output_database, if the serial (key) is found in the file_walk_database,
+    add the local path and the identified MIME type from 'magic'.
+    """
     sha1_file_set = set(file_walk_database.keys())
-    for key in output_database:
+    for key, val_dict in output_database.items():
         if key in sha1_file_set:
             location = file_walk_database[key]
-            file_type = magic_generator.id_filename(location)
-            output_database[key]['path'] = location
-            output_database[key]['type'] = file_type
+            try:
+                file_type = magic_generator.id_filename(location)
+            except Exception as e:
+                logging.warning(f'[!] Could not get MIME type for {location} -> {e}')
+                file_type = 'Unknown'
+            val_dict['path'] = location
+            val_dict['type'] = file_type
 
+def filter_manifest_by_domain_str(output_database, domain_str, print_report=False):
+    """
+    Return a dict of entries whose 'domain' matches domain_str exactly.
+    If print_report is True, logs them out.
+    """
+    result_dict = {}
+    type_dict = {}
+    for key, val_dict in output_database.items():
+        if val_dict['path'] != 'Unknown' and val_dict['domain'] == domain_str:
+            result_dict[key] = val_dict
+            t = val_dict['type']
+            type_dict[t] = type_dict.get(t, 0) + 1
+            if print_report:
+                logging.info(f'[i] Key: {key} -> {val_dict}')
 
-def process_url_file():
-    global sms_database, output_database, sms_database, url_set
-    if sms_db_hash is not None:
-        _path = output_database[sms_db_hash]['path']
-        examine_and_process_db_file(_path)
-        for key in sms_database:
-            sms_database[key] = global_filter(sms_database[key])
+    if print_report:
+        logging.info('[i] Type counts in this domain filter:')
+        for t, count in type_dict.items():
+            logging.info(f'[i] MIME Type: {t}  Count: {count}')
 
-    f_out = open('urls.txt', 'w')
-    for url in url_set:
-        f_out.write(f'{url}\n')
-    f_out.close()
+    return result_dict
 
+def filter_manifest_by_mime_type(output_database, mime_substring, print_report=False):
+    """
+    Return a dict of entries whose 'type' (MIME) contains mime_substring.
+    If print_report is True, logs them out.
+    """
+    result_dict = {}
+    type_dict = {}
+    for key, val_dict in output_database.items():
+        if val_dict['path'] != 'Unknown' and mime_substring in val_dict['type']:
+            result_dict[key] = val_dict
+            t = val_dict['type']
+            type_dict[t] = type_dict.get(t, 0) + 1
+            if print_report:
+                logging.info(f'[i] Key: {key} -> {val_dict}')
+
+    if print_report:
+        logging.info('[i] Type counts in this MIME filter:')
+        for t, count in type_dict.items():
+            logging.info(f'[i] MIME Type: {t}  Count: {count}')
+
+    return result_dict
+
+def filter_manifest_by_sql_entry(output_database, sql_substring, print_report=False):
+    """
+    Return a dict of entries whose 'sql_entry' contains sql_substring.
+    If print_report is True, logs them out.
+    """
+    result_dict = {}
+    type_dict = {}
+    for key, val_dict in output_database.items():
+        if val_dict['path'] != 'Unknown' and sql_substring in val_dict['sql_entry']:
+            result_dict[key] = val_dict
+            t = val_dict['type']
+            type_dict[t] = type_dict.get(t, 0) + 1
+            if print_report:
+                logging.info(f'[i] Key: {key} -> {val_dict}')
+
+    if print_report:
+        logging.info('[i] Type counts in this sql_entry filter:')
+        for t, count in type_dict.items():
+            logging.info(f'[i] MIME Type: {t}  Count: {count}')
+
+    return result_dict
+
+def copy_to_tmp(data_dict):
+    """
+    Copy all files from the data_dict (which is an output_database) into 
+    a timestamped output folder within the current working directory.
+    """
+    target_path = time.strftime("%Y%m%d-%H%M%S") + "_output"
+    try:
+        os.mkdir(target_path)
+    except FileExistsError:
+        logging.warning(f'[!] Output folder already exists: {target_path}')
+
+    for key, val_dict in data_dict.items():
+        filename = os.path.basename(val_dict['sql_entry']).replace(' ', '_')
+        file_path = val_dict['path']
+        if not os.path.isfile(file_path):
+            logging.warning(f'[!] Source not found or not a file: {file_path}')
+            continue
+        dest_path = os.path.join(target_path, filename)
+        try:
+            shutil.copy(file_path, dest_path)
+            logging.info(f'[i] Copied {file_path} -> {dest_path}')
+        except Exception as e:
+            logging.error(f'[x] Could not copy {file_path} -> {dest_path} : {e}')
+
+def process_url_file(url_set):
+    """
+    Write all collected URLs to urls.txt, and log how many were found.
+    """
+    if not url_set:
+        logging.info('[i] No URLs found, skipping write to urls.txt')
+        return
+    try:
+        with open('urls.txt', 'w') as f_out:
+            for url in url_set:
+                f_out.write(f'{url}\n')
+        logging.info(f'[i] Wrote {len(url_set)} URLs to urls.txt')
+    except Exception as e:
+        logging.error(f'[x] Error writing urls.txt -> {e}')
+
+def examine_and_process_db_file(file_path, 
+                                url_block_list, 
+                                url_set,
+                                output_database,
+                                sms_database):
+    """
+    Main function that:
+      1. Checks if file_path is an SQLite3 file.
+      2. Converts DB to dictionary, collects relevant data.
+      3. Walks the backup folder to map files to their SHA1 name.
+    """
+    if not os.path.isfile(file_path):
+        logging.error(f'[x] The supplied file_path is invalid: {file_path}')
+        return None
+
+    if not is_sqlite3(file_path):
+        logging.warning(f'[!] The following supplied file path is not SQLite3 -> {file_path}')
+        return None
+
+    # Convert the main manifest.db file to a dictionary
+    sql_dict = convert_sqlite3_to_sql_dict(file_path)
+    if not sql_dict:
+        logging.warning('[!] No valid data found in the database.')
+        return None
+
+    # Build the output_database by iterating the SQL dictionary
+    sms_db_hash = iterate_sql_dict(sql_dict, output_database, sms_database,
+                                   url_block_list, url_set)
+
+    # Walk the directory to map SHA1 to local paths
+    file_walk_database = walk_the_backup(file_path)
+
+    return sms_db_hash, file_walk_database
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
 
 def main():
-    global start_time
+    start_time = time.time()
+
+    # Parse CLI args
     args = parse_args()
     file_path = args.file_path
 
-    examine_and_process_db_file(file_path)
-    add_metadata_to_db_file()
+    # Initialize data structures
+    output_database = {}
+    sms_database = {}
+    url_set = set()
+    url_block_list = ['content.icloud.com']
+    magic_generator = magic.Magic(flags=magic.MAGIC_MIME_TYPE)
 
-    # filter_manifest_by_domain_str('RootDomain', print_report=True)    # Filter By Domain String Example
-    # filter_manifest_by_mime_type('text/plain', print_report=True)     # Filter By MIME Extension Type Example
-    # filter_manifest_by_sql_entry('sms.db', print_report=True)         # Filter By SQL Entry String Example
+    # Examine the primary manifest.db file
+    sms_db_hash, file_walk_database = examine_and_process_db_file(
+        file_path, 
+        url_block_list, 
+        url_set, 
+        output_database, 
+        sms_database
+    ) or (None, {})
 
-    # Copy Images Example
-    # filter_manifest_by_mime_type('image', print_report=True)          # Filter Only Images for Image Copy Next
-    # copy_to_tmp(output_database)                                      # Copy ALL MIME Image Type Files to /tmp
+    # If valid data, proceed
+    if output_database and file_walk_database:
+        # Add MIME info and path data
+        add_metadata_to_db_file(output_database, file_walk_database, magic_generator)
 
-    process_url_file()
+        # Potential usage examples (uncomment as needed):
+        # filter_manifest_by_domain_str(output_database, 'RootDomain', print_report=True)
+        # filter_manifest_by_mime_type(output_database, 'text/plain', print_report=True)
+        # filter_manifest_by_sql_entry(output_database, 'sms.db', print_report=True)
+
+        # # Copy images example:
+        # images_dict = filter_manifest_by_mime_type(output_database, 'image', print_report=True)
+        # copy_to_tmp(images_dict)
+
+    # If we identified an sms.db in the main DB, we can parse it here too
+    if sms_db_hash and sms_db_hash in output_database:
+        sms_db_entry = output_database[sms_db_hash]
+        # Examine the SMS database for URLs
+        sms_db_path = sms_db_entry['path']
+        if os.path.isfile(sms_db_path):
+            # Convert SMS DB to dict, then filter for URLs
+            sms_dict = convert_sqlite3_to_sql_dict(sms_db_path)
+            for key, data_body in sms_dict.items():
+                global_filter(data_body, url_block_list, 
+                              lambda u, block_list: add_url(u, block_list, url_set))
+        else:
+            logging.warning(f'[!] SMS database path does not exist on disk: {sms_db_path}')
+
+    # Write all discovered URLs to urls.txt
+    process_url_file(url_set)
+
+    # Print elapsed time
     print_elapsed_time(start_time)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
